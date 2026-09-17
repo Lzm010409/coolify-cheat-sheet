@@ -20,9 +20,14 @@ services:
     image: 'ghcr.io/gitroomhq/postiz-app:v2.23.0'
     environment:
       - SERVICE_FQDN_POSTIZ_5000
-      - 'MAIN_URL=${SERVICE_FQDN_POSTIZ}'
-      - 'FRONTEND_URL=${SERVICE_FQDN_POSTIZ}'
-      - 'NEXT_PUBLIC_BACKEND_URL=${SERVICE_FQDN_POSTIZ}/api'
+      # Fest verdrahtet statt ${SERVICE_FQDN_POSTIZ}: diese Coolify-Variable
+      # liefert den Hostnamen OHNE Schema. Bis v2.11 war das folgenlos, ab
+      # v2.23 baut der MCP-Start new URL('/mcp-oauth', NEXT_PUBLIC_BACKEND_URL)
+      # und stirbt dann mit ERR_INVALID_URL, was den Backend-Prozess in eine
+      # Dauer-Restartschleife schickt.
+      - 'MAIN_URL=https://postiz.gollenstede.app'
+      - 'FRONTEND_URL=https://postiz.gollenstede.app'
+      - 'NEXT_PUBLIC_BACKEND_URL=https://postiz.gollenstede.app/api'
       - 'JWT_SECRET=${SERVICE_PASSWORD_JWTSECRET}'
       - 'DATABASE_URL=postgresql://postgres:${SERVICE_PASSWORD_POSTGRESQL}@postgres:5432/${POSTGRESQL_DATABASE:-postiz-db}'
       - 'REDIS_URL=redis://default:${SERVICE_PASSWORD_REDIS}@redis:6379'
@@ -87,6 +92,34 @@ services:
       - 'STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}'
       - 'STRIPE_SIGNING_KEY=${STRIPE_SIGNING_KEY}'
       - 'STRIPE_SIGNING_KEY_CONNECT=${STRIPE_SIGNING_KEY_CONNECT}'
+    # Ohne diese Angabe bleibt ServiceApplication.ports_exposes leer und
+    # Traefik baut ueberhaupt keinen Router -> 404 trotz laufendem
+    # Container. Die Port-Angabe im FQDN allein reicht nicht, Coolify
+    # schneidet sie beim Setzen ueber die API wieder ab.
+    expose:
+      - '5000'
+    # Eigene Traefik-Regeln, weil Coolifys generierte Labels hier nur einen
+    # Router ohne Backend-Port erzeugen (Antwort: 503). Das Image exponiert
+    # mehrere Ports (3000/4200/5000); ohne loadbalancer.server.port kann
+    # Traefik sich nicht entscheiden. priority=1000 sorgt dafuer, dass diese
+    # Router gegenueber den generierten gewinnen, die dieselbe Host-Regel
+    # tragen. traefik.docker.network ist noetig, seit der Stack zusaetzlich
+    # am geteilten coolify-Netz haengt - sonst waehlt Traefik u.U. die IP
+    # aus dem Stack-eigenen Netz, das es selbst nicht erreicht.
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - 'traefik.http.routers.postiz-fix-https.rule=Host(`postiz.gollenstede.app`)'
+      - traefik.http.routers.postiz-fix-https.entrypoints=https
+      - traefik.http.routers.postiz-fix-https.tls=true
+      - traefik.http.routers.postiz-fix-https.tls.certresolver=letsencrypt
+      - traefik.http.routers.postiz-fix-https.service=postiz-fix
+      - traefik.http.routers.postiz-fix-https.priority=1000
+      - 'traefik.http.routers.postiz-fix-http.rule=Host(`postiz.gollenstede.app`)'
+      - traefik.http.routers.postiz-fix-http.entrypoints=http
+      - traefik.http.routers.postiz-fix-http.service=postiz-fix
+      - traefik.http.routers.postiz-fix-http.priority=1000
+      - traefik.http.services.postiz-fix.loadbalancer.server.port=5000
     volumes:
       - 'postiz-config:/config/'
       - 'postiz-uploads:/uploads/'
@@ -98,9 +131,13 @@ services:
       temporal:
         condition: service_started
     healthcheck:
+      # Bewusst /auth statt /: die Wurzel antwortet mit 307 auf MAIN_URL.
+      # wget folgt dem Redirect, landet auf der oeffentlichen Domain und
+      # schlaegt fehl, solange Traefik den Host noch nicht kennt - der
+      # Container waere dann "unhealthy", obwohl die App laeuft.
       test:
         - CMD-SHELL
-        - 'wget -qO- http://127.0.0.1:5000/'
+        - 'wget -qO- http://127.0.0.1:5000/auth'
       interval: 10s
       timeout: 20s
       retries: 30
@@ -155,7 +192,47 @@ services:
       - DEFAULT_NAMESPACE=default
       - DEFAULT_NAMESPACE_RETENTION=72h
       - SKIP_DEFAULT_NAMESPACE_CREATION=false
+      # Visibility ueber Elasticsearch statt ueber Postgres. Grund: Postiz
+      # registriert beim Backend-Start mehr als drei Suchattribute vom Typ
+      # "Text". Die SQL-Visibility hat dafuer fest nur drei Spalten
+      # (Text01..Text03), deshalb bricht das Backend sonst mit
+      #   INVALID_ARGUMENT: cannot have more than 3 search attribute of type Text
+      # ab und laeuft in eine Restart-Schleife. Das ist ein Schema-Limit,
+      # keine Einstellung - ES ist der vom Postiz-Projekt vorgesehene Weg.
+      - ENABLE_ES=true
+      - ES_SEEDS=elasticsearch
+      - ES_VERSION=v7
+      - 'DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml'
     depends_on:
       postgres:
         condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+  # Nur Visibility-Store fuer Temporal, keine Postiz-Daten. Heap bewusst klein
+  # (256 MB), damit der Stack auf der 4-GB-Maschine Luft behaelt.
+  # discovery.type=single-node schaltet zugleich die Bootstrap-Checks ab, sonst
+  # scheitert ES am vm.max_map_count des Hosts.
+  elasticsearch:
+    image: 'elasticsearch:7.17.27'
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - 'ES_JAVA_OPTS=-Xms256m -Xmx256m'
+      - cluster.routing.allocation.disk.threshold_enabled=true
+      - cluster.routing.allocation.disk.watermark.low=512mb
+      - cluster.routing.allocation.disk.watermark.high=256mb
+      - cluster.routing.allocation.disk.watermark.flood_stage=128mb
+    volumes:
+      - 'temporal-elasticsearch-data:/usr/share/elasticsearch/data'
+    expose:
+      - '9200'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'curl -fsS http://127.0.0.1:9200/_cluster/health | grep -qE ''"status":"(green|yellow)"'''
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
     restart: unless-stopped
