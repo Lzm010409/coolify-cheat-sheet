@@ -36,6 +36,10 @@ services:
       - DATABASE_URL=postgresql://postgres:${POSTIZ_DB_PASSWORD}@postiz-db:5432/${POSTGRESQL_DATABASE:-postiz-db}
       - REDIS_URL=redis://default:${SERVICE_PASSWORD_REDIS}@postiz-redis:6379
       - BACKEND_INTERNAL_URL=http://localhost:3000
+      # Der Orchestrator baut beim Start ein Temporal-Bundle per webpack und
+      # wurde dabei reproduzierbar vom OOM-Killer beendet (Exit 137). Der
+      # begrenzte Heap zwingt Node zum Aufraeumen statt zum Ballonieren.
+      - NODE_OPTIONS=--max-old-space-size=${NODE_HEAP_MB:-1536}
       - DISABLE_REGISTRATION=${DISABLE_REGISTRATION:-false}
       # Temporal aus diesem Stack, aufgeloest ueber das Compose-Netz.
       - TEMPORAL_ADDRESS=postiz-temporal:7233
