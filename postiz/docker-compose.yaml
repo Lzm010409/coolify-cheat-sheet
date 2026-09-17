@@ -7,10 +7,14 @@
 #   2. Postgres-, Uploads- und Config-Volume der alten Instanz haengen per
 #      Bind-Mount drin, damit die Daten erhalten bleiben.
 #   3. postgres-password-sync gleicht das Rollen-Passwort an die Coolify-Env an.
+#   4. Temporal laeuft als Teil dieses Stacks. Der separate Temporal-Service
+#      waere nur ueber Coolifys gemeinsames Docker-Netz erreichbar - genau daran
+#      ist die alte Instanz gescheitert. Im Stack reicht die Compose-interne
+#      Namensaufloesung.
 #
-# Versionswahl: v2.23.0 passt zum Schema der uebernommenen DB, braucht aber
-# TEMPORAL_ADDRESS. v2.11.0 und aelter laufen ohne Temporal, dann loescht Prisma
-# aber die Spalten shortlink, creationMethod, delay und sendStreakEmails.
+# Versionswahl: v2.23.0 passt zum Schema der uebernommenen DB. Ab v2.13 ist
+# Temporal Pflicht; v2.11.0 und aelter kaemen ohne aus, wuerden dafuer aber die
+# Spalten shortlink, creationMethod, delay und sendStreakEmails loeschen.
 #
 # WICHTIG: Die alte Instanz (Service vcjzigduzuxw3cp5xxydolt0) muss gestoppt
 # bleiben, solange diese hier laeuft - beide teilen sich das Postgres-Volume.
@@ -28,10 +32,9 @@ services:
       - REDIS_URL=redis://default:${SERVICE_PASSWORD_REDIS}@redis:6379
       - BACKEND_INTERNAL_URL=http://localhost:3000
       - DISABLE_REGISTRATION=${DISABLE_REGISTRATION:-false}
-      # Ab v2.13 ist Temporal Pflicht. Zeigt auf den separaten Temporal-Service;
-      # dafuer muss der Service in Coolify am gemeinsamen Docker-Netz haengen
-      # (connect_to_docker_network), sonst schlaegt die Namensaufloesung fehl.
-      - TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS}
+      # Temporal aus diesem Stack, aufgeloest ueber das Compose-Netz.
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
 
       # Cloudflare R2
       - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
@@ -112,7 +115,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-password-sync:
+        condition: service_healthy
       redis:
+        condition: service_healthy
+      temporal:
         condition: service_healthy
     healthcheck:
       test:
@@ -153,7 +160,42 @@ services:
     entrypoint:
       - /bin/sh
       - -c
-      - psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD '$${NEW_PASSWORD}';" && echo "postgres password synced" && tail -f /dev/null
+      - psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD '$${NEW_PASSWORD}';" && touch /tmp/synced && echo "postgres password synced" && tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/synced"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  # Temporal legt sich seine beiden Schemas selbst in der vorhandenen Postgres
+  # an (temporal, temporal_visibility) - die Postiz-DB bleibt unberuehrt.
+  temporal:
+    image: temporalio/auto-setup:1.28.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-password-sync:
+        condition: service_healthy
+    environment:
+      # auto-setup nutzt TEMPORAL_ADDRESS selbst, um den Server fuer die
+      # Namespace-Registrierung zu erreichen. Ohne diese Zeile greift die
+      # service-weite Coolify-Variable und zeigt auf den falschen Host.
+      - TEMPORAL_ADDRESS=127.0.0.1:7233
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_SEEDS=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PWD=${SERVICE_PASSWORD_POSTGRESQL}
+      - DBNAME=temporal
+      - VISIBILITY_DBNAME=temporal_visibility
+      - DEFAULT_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+      - DEFAULT_NAMESPACE_RETENTION=72h
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/7233' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
 
   redis:
     image: redis:7.2
