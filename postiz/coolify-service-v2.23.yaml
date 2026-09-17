@@ -92,34 +92,14 @@ services:
       - 'STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}'
       - 'STRIPE_SIGNING_KEY=${STRIPE_SIGNING_KEY}'
       - 'STRIPE_SIGNING_KEY_CONNECT=${STRIPE_SIGNING_KEY_CONNECT}'
-    # Ohne diese Angabe bleibt ServiceApplication.ports_exposes leer und
-    # Traefik baut ueberhaupt keinen Router -> 404 trotz laufendem
-    # Container. Die Port-Angabe im FQDN allein reicht nicht, Coolify
-    # schneidet sie beim Setzen ueber die API wieder ab.
+    # Notwendig: erst damit erzeugt Coolify ueberhaupt Traefik-Labels fuer
+    # diesen Container - inklusive
+    #   traefik.http.services.<...>.loadbalancer.server.port=5000
+    # Ohne expose gibt es gar keinen Router (404 trotz laufendem Container).
+    # Den Port im FQDN mitzugeben funktioniert nicht: Coolify schneidet ihn
+    # auf jedem API-Weg wieder ab (urls, url, SERVICE_FQDN_POSTIZ_5000).
     expose:
       - '5000'
-    # Eigene Traefik-Regeln, weil Coolifys generierte Labels hier nur einen
-    # Router ohne Backend-Port erzeugen (Antwort: 503). Das Image exponiert
-    # mehrere Ports (3000/4200/5000); ohne loadbalancer.server.port kann
-    # Traefik sich nicht entscheiden. priority=1000 sorgt dafuer, dass diese
-    # Router gegenueber den generierten gewinnen, die dieselbe Host-Regel
-    # tragen. traefik.docker.network ist noetig, seit der Stack zusaetzlich
-    # am geteilten coolify-Netz haengt - sonst waehlt Traefik u.U. die IP
-    # aus dem Stack-eigenen Netz, das es selbst nicht erreicht.
-    labels:
-      - traefik.enable=true
-      - traefik.docker.network=coolify
-      - 'traefik.http.routers.postiz-fix-https.rule=Host(`postiz.gollenstede.app`)'
-      - traefik.http.routers.postiz-fix-https.entrypoints=https
-      - traefik.http.routers.postiz-fix-https.tls=true
-      - traefik.http.routers.postiz-fix-https.tls.certresolver=letsencrypt
-      - traefik.http.routers.postiz-fix-https.service=postiz-fix
-      - traefik.http.routers.postiz-fix-https.priority=1000
-      - 'traefik.http.routers.postiz-fix-http.rule=Host(`postiz.gollenstede.app`)'
-      - traefik.http.routers.postiz-fix-http.entrypoints=http
-      - traefik.http.routers.postiz-fix-http.service=postiz-fix
-      - traefik.http.routers.postiz-fix-http.priority=1000
-      - traefik.http.services.postiz-fix.loadbalancer.server.port=5000
     volumes:
       - 'postiz-config:/config/'
       - 'postiz-uploads:/uploads/'
