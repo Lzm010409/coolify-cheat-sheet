@@ -119,13 +119,13 @@ services:
       - /var/lib/docker/volumes/vcjzigduzuxw3cp5xxydolt0_postiz-uploads/_data:/uploads/
     depends_on:
       postiz-db:
-        condition: service_healthy
+        condition: service_started
       postiz-db-password-sync:
-        condition: service_healthy
+        condition: service_started
       postiz-redis:
-        condition: service_healthy
+        condition: service_started
       postiz-temporal:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test:
         - CMD-SHELL
@@ -157,7 +157,7 @@ services:
     image: postgres:14.5
     depends_on:
       postiz-db:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - pg-socket:/var/run/postgresql
     environment:
@@ -165,7 +165,7 @@ services:
     entrypoint:
       - /bin/sh
       - -c
-      - echo "pw-laenge=$${#NEW_PASSWORD} sonderzeichen=$$(printf %s "$${NEW_PASSWORD}" | tr -d "[:alnum:]" | wc -c)" && psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD '$${NEW_PASSWORD}';" && touch /tmp/synced && echo "postgres password synced" && tail -f /dev/null
+      - echo "pw-laenge=$${#NEW_PASSWORD} sonderzeichen=$$(printf %s "$${NEW_PASSWORD}" | tr -d "[:alnum:]" | wc -c)"; until psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD '$${NEW_PASSWORD}';"; do echo "warte auf postgres"; sleep 3; done; touch /tmp/synced; echo "postgres password synced"; tail -f /dev/null
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/synced"]
       interval: 3s
@@ -178,9 +178,9 @@ services:
     image: temporalio/auto-setup:1.28.1
     depends_on:
       postiz-db:
-        condition: service_healthy
+        condition: service_started
       postiz-db-password-sync:
-        condition: service_healthy
+        condition: service_started
     environment:
       # auto-setup nutzt TEMPORAL_ADDRESS selbst, um den Server fuer die
       # Namespace-Registrierung zu erreichen. Ohne diese Zeile greift die
