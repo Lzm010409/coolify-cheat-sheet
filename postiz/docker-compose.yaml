@@ -153,7 +153,8 @@ services:
       - |
         (
           until pg_isready -U postgres -q; do sleep 2; done
-          psql -U postgres -v pw="$$POSTIZ_DB_PASSWORD" -c "ALTER USER postgres PASSWORD :'pw';" \
+          printf "ALTER USER postgres PASSWORD :'pw';\n" \
+            | psql -U postgres -v pw="$$POSTIZ_DB_PASSWORD" \
             && echo "postgres password synced"
         ) &
         exec docker-entrypoint.sh postgres
