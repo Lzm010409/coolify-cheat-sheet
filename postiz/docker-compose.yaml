@@ -124,6 +124,25 @@ services:
         condition: service_started
       postiz-temporal:
         condition: service_started
+    networks:
+      - default
+      - coolify
+    # Coolifys generierte Labels registrieren den Container hier nicht als
+    # Backend - Traefik hat dann zwar eine Route, aber kein Ziel (503).
+    # Deshalb Router und Zielport explizit.
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.postiz-http.entryPoints=http
+      - traefik.http.routers.postiz-http.rule=Host(`postiz.gollenstede.app`)
+      - traefik.http.routers.postiz-http.middlewares=postiz-to-https
+      - traefik.http.routers.postiz-https.entryPoints=https
+      - traefik.http.routers.postiz-https.rule=Host(`postiz.gollenstede.app`)
+      - traefik.http.routers.postiz-https.tls=true
+      - traefik.http.routers.postiz-https.tls.certresolver=letsencrypt
+      - traefik.http.routers.postiz-https.service=postiz-app
+      - traefik.http.services.postiz-app.loadbalancer.server.port=5000
+      - traefik.http.middlewares.postiz-to-https.redirectscheme.scheme=https
     healthcheck:
       test:
         - CMD-SHELL
@@ -216,3 +235,7 @@ volumes:
   # Redis haelt nur Queue-/Cache-Daten: bewusst frisch, damit keine haengenden
   # Jobs aus der kaputten Instanz uebernommen werden.
   postiz-redis-data:
+
+networks:
+  coolify:
+    external: true
