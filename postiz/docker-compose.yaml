@@ -124,6 +124,9 @@ services:
         condition: service_started
       postiz-temporal:
         condition: service_started
+    # Ohne Port-Label waehlt Traefik den exponierten Port des Containers.
+    expose:
+      - "5000"
     networks:
       - default
       - coolify
