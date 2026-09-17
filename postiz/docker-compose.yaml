@@ -6,11 +6,16 @@
 #      ohne den bricht der Backend-Start ab ("Backend failed to start on 3000").
 #   2. Postgres-, Uploads- und Config-Volume der alten Instanz haengen per
 #      Bind-Mount drin, damit die Daten erhalten bleiben.
-#   3. postgres-password-sync gleicht das Rollen-Passwort an die Coolify-Env an.
+#   3. postgres-password-sync gleicht das Rollen-Passwort an POSTIZ_DB_PASSWORD an.
+#      Bewusst keine SERVICE_*-Variable: die generiert Coolify selbst neu, und
+#      Sonderzeichen darin zerlegen die DATABASE_URL von Postiz.
 #   4. Temporal laeuft als Teil dieses Stacks. Der separate Temporal-Service
 #      waere nur ueber Coolifys gemeinsames Docker-Netz erreichbar - genau daran
 #      ist die alte Instanz gescheitert. Im Stack reicht die Compose-interne
 #      Namensaufloesung.
+#   5. Die Dienste heissen eindeutig (postiz-db statt postgres): im gemeinsamen
+#      Docker-Netz, das Traefik zum Routen braucht, kollidieren generische
+#      Namen sonst mit gleichnamigen Containern anderer Stacks.
 #
 # Versionswahl: v2.23.0 passt zum Schema der uebernommenen DB. Ab v2.13 ist
 # Temporal Pflicht; v2.11.0 und aelter kaemen ohne aus, wuerden dafuer aber die
@@ -28,12 +33,12 @@ services:
       - FRONTEND_URL=${SERVICE_URL_POSTIZ}
       - NEXT_PUBLIC_BACKEND_URL=${SERVICE_URL_POSTIZ}/api
       - JWT_SECRET=${SERVICE_PASSWORD_JWTSECRET}
-      - DATABASE_URL=postgresql://postgres:${SERVICE_PASSWORD_POSTGRESQL}@postgres:5432/${POSTGRESQL_DATABASE:-postiz-db}
-      - REDIS_URL=redis://default:${SERVICE_PASSWORD_REDIS}@redis:6379
+      - DATABASE_URL=postgresql://postgres:${POSTIZ_DB_PASSWORD}@postiz-db:5432/${POSTGRESQL_DATABASE:-postiz-db}
+      - REDIS_URL=redis://default:${SERVICE_PASSWORD_REDIS}@postiz-redis:6379
       - BACKEND_INTERNAL_URL=http://localhost:3000
       - DISABLE_REGISTRATION=${DISABLE_REGISTRATION:-false}
       # Temporal aus diesem Stack, aufgeloest ueber das Compose-Netz.
-      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_ADDRESS=postiz-temporal:7233
       - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
 
       # Cloudflare R2
@@ -113,13 +118,13 @@ services:
       - /var/lib/docker/volumes/vcjzigduzuxw3cp5xxydolt0_postiz-config/_data:/config/
       - /var/lib/docker/volumes/vcjzigduzuxw3cp5xxydolt0_postiz-uploads/_data:/uploads/
     depends_on:
-      postgres:
+      postiz-db:
         condition: service_healthy
-      postgres-password-sync:
+      postiz-db-password-sync:
         condition: service_healthy
-      redis:
+      postiz-redis:
         condition: service_healthy
-      temporal:
+      postiz-temporal:
         condition: service_healthy
     healthcheck:
       test:
@@ -129,14 +134,14 @@ services:
       timeout: 20s
       retries: 10
 
-  postgres:
+  postiz-db:
     image: postgres:14.5
     volumes:
       - /var/lib/docker/volumes/vcjzigduzuxw3cp5xxydolt0_postiz-postgresql-data/_data:/var/lib/postgresql/data
       - pg-socket:/var/run/postgresql
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${SERVICE_PASSWORD_POSTGRESQL}
+      - POSTGRES_PASSWORD=${POSTIZ_DB_PASSWORD}
       - POSTGRES_DB=${POSTGRESQL_DATABASE:-postiz-db}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB:-postiz-db}"]
@@ -146,21 +151,21 @@ services:
 
   # Das uebernommene Datenverzeichnis traegt noch das Passwort der alten
   # Instanz. POSTGRES_PASSWORD greift nur bei einer Neuinitialisierung, deshalb
-  # wird das Rollen-Passwort hier einmalig an SERVICE_PASSWORD_POSTGRESQL
-  # angeglichen - ueber den Unix-Socket, der lokal auf trust steht.
-  postgres-password-sync:
+  # wird das Rollen-Passwort hier an POSTIZ_DB_PASSWORD angeglichen - ueber den
+  # Unix-Socket, der lokal auf trust steht.
+  postiz-db-password-sync:
     image: postgres:14.5
     depends_on:
-      postgres:
+      postiz-db:
         condition: service_healthy
     volumes:
       - pg-socket:/var/run/postgresql
     environment:
-      - NEW_PASSWORD=${SERVICE_PASSWORD_POSTGRESQL}
+      - NEW_PASSWORD=${POSTIZ_DB_PASSWORD}
     entrypoint:
       - /bin/sh
       - -c
-      - psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD '$${NEW_PASSWORD}';" && touch /tmp/synced && echo "postgres password synced" && tail -f /dev/null
+      - echo "pw-laenge=$${#NEW_PASSWORD} sonderzeichen=$$(printf %s "$${NEW_PASSWORD}" | tr -d "[:alnum:]" | wc -c)" && psql -h /var/run/postgresql -U postgres -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD '$${NEW_PASSWORD}';" && touch /tmp/synced && echo "postgres password synced" && tail -f /dev/null
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/synced"]
       interval: 3s
@@ -169,12 +174,12 @@ services:
 
   # Temporal legt sich seine beiden Schemas selbst in der vorhandenen Postgres
   # an (temporal, temporal_visibility) - die Postiz-DB bleibt unberuehrt.
-  temporal:
+  postiz-temporal:
     image: temporalio/auto-setup:1.28.1
     depends_on:
-      postgres:
+      postiz-db:
         condition: service_healthy
-      postgres-password-sync:
+      postiz-db-password-sync:
         condition: service_healthy
     environment:
       # auto-setup nutzt TEMPORAL_ADDRESS selbst, um den Server fuer die
@@ -182,25 +187,25 @@ services:
       # service-weite Coolify-Variable und zeigt auf den falschen Host.
       # Loopback funktioniert nicht: der Listener bindet per Default auf die
       # Container-IP, deshalb der eigene Servicename.
-      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_ADDRESS=postiz-temporal:7233
       - BIND_ON_IP=0.0.0.0
       - DB=postgres12
       - DB_PORT=5432
-      - POSTGRES_SEEDS=postgres
+      - POSTGRES_SEEDS=postiz-db
       - POSTGRES_USER=postgres
-      - POSTGRES_PWD=${SERVICE_PASSWORD_POSTGRESQL}
+      - POSTGRES_PWD=${POSTIZ_DB_PASSWORD}
       - DBNAME=temporal
       - VISIBILITY_DBNAME=temporal_visibility
       - DEFAULT_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
       - DEFAULT_NAMESPACE_RETENTION=72h
     healthcheck:
-      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/temporal/7233' || exit 1"]
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/postiz-temporal/7233' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
       start_period: 60s
 
-  redis:
+  postiz-redis:
     image: redis:7.2
     environment:
       - REDIS_PASSWORD=${SERVICE_PASSWORD_REDIS}
