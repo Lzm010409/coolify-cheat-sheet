@@ -1,0 +1,157 @@
+# MetaMCP - RAM-Fix (Coolify, Docker Compose)
+#
+# BEFUND: Die MetaMCP-Instanz haeuft ueber die Laufzeit hinweg immer mehr RAM
+# an (beobachtet: >2 GB, ca. 33% der gesamten Serverressourcen), ohne dass
+# mehr Traffic das erklaeren wuerde - eine "Treppenstufen"-Kurve statt eines
+# sauberen Sawtooth-Musters durch regelmaessige Garbage Collection. Das ist
+# kein Bug dieser Compose-Datei, sondern liegt an der Upstream-Architektur:
+#
+#   1. MetaMCP haelt fuer JEDEN konfigurierten MCP-Server (pro Namespace)
+#      mindestens eine IDLE-Session dauerhaft offen - Default ist 1 Idle-
+#      Session je Server ("pre-allocated idle sessions"). Jede Session ist
+#      ein laufender stdio-Kindprozess bzw. eine offene SSE-Verbindung
+#      innerhalb desselben Node-Prozesses. Die Baseline waechst also linear
+#      mit der Zahl konfigurierter Server/Namespaces - unabhaengig davon, ob
+#      sie gerade benutzt werden.
+#   2. Das offizielle Image setzt KEIN NODE_OPTIONS: V8 darf den Heap frei bis
+#      an den verfuegbaren Hostspeicher wachsen lassen, statt frueh zu
+#      komprimieren bzw. GC auszuloesen (gleiches Muster wie beim Postiz-Fix
+#      in diesem Repo).
+#   3. MCP-SDKs (TypeScript wie Python) haben dokumentierte Faelle von
+#      unbegrenztem Speicherwachstum pro Tool-Call/Session, wenn Verbindungen
+#      oder Puffer nicht sauber freigegeben werden (siehe
+#      modelcontextprotocol/python-sdk#1076 sowie metatool-ai/metamcp#131,
+#      "sub-MCP crashes main app" - ein abstuerzender Sub-MCP reisst Ressourcen
+#      im Hauptprozess mit).
+#   4. Ohne Docker-seitiges Memory-Limit faellt das nicht als OOM-Kill auf,
+#      sondern der Container waechst still weiter und konkurriert mit anderen
+#      Stacks auf demselben Host um RAM.
+#
+# FIX (gleiche Strategie wie beim Postiz-Workaround: Heap deckeln + harte
+# Container-Grenze + Self-Healing statt manuellem Eingreifen):
+#   - NODE_OPTIONS=--max-old-space-size begrenzt den V8-Heap, damit GC vor dem
+#     Anschlag greift statt der Prozess unbegrenzt weiterzuwachsen.
+#   - mem_limit/mem_reservation deckeln den Container zusaetzlich hart auf
+#     Docker-Ebene - das faengt auch Leaks ausserhalb des JS-Heaps ab (native
+#     Buffer, stdio-Kindprozesse der Sub-MCPs). "deploy.resources.limits"
+#     wird von Coolifys Compose-Modus (kein Swarm) ignoriert, deshalb hier
+#     bewusst die Legacy-Keys.
+#   - restart: unless-stopped macht aus einem OOM-Kill (Exit 137) einen
+#     automatischen Neustart statt eines haengenden Containers - der Worst
+#     Case ist damit auf mem_limit begrenzt statt auf 33% des Hosts.
+#   - Zusaetzlich in der MetaMCP-UI pruefen: ungenutzte Namespaces/MCP-Server
+#     entfernen. Jeder eingesparte Server spart eine dauerhaft offene
+#     Idle-Session und damit Baseline-RAM (siehe Punkt 1 oben).
+#   - Mittelfristig beobachten: der (noch experimentelle) docker-per-mcp-
+#     Branch von MetaMCP isoliert jeden Sub-MCP in einem eigenen Container
+#     mit eigenem Limit, statt alle im gemeinsamen MetaMCP-Prozess zu halten.
+#     Sobald stabil, ist das der sauberere Fix als das globale Limit hier.
+#
+# Nach dem Deploy verifizieren: `docker stats metamcp` ueber ein paar Tage
+# beobachten - Saegezahn (waechst, faellt durch GC) ist gesund, eine Treppe
+# ohne Plateau bedeutet weiterhin einen Leak und mem_limit muss ggf. sorgfaeltig
+# neu bemessen werden.
+#
+# Quellen: docs.metamcp.com/en/deployment/custom-deployment (Idle Sessions,
+# Memory-Empfehlung), github.com/metatool-ai/metamcp Issue #131
+# (Docker-per-MCP), github.com/metatool-ai/metamcp docker-compose.yml und
+# example.env (Upstream-Referenz fuer die uebernommenen Variablen).
+
+services:
+  metamcp:
+    container_name: metamcp
+    image: ghcr.io/metatool-ai/metamcp:latest
+    environment:
+      - NODE_ENV=production
+      - LOG_LEVEL=${LOG_LEVEL:-errors-only}
+      # Heap-Deckel: siehe FIX oben. Startwert bewusst konservativ, damit V8
+      # deutlich unterhalb von mem_limit komprimiert statt erst am Container-
+      # Limit vom Kernel gekillt zu werden.
+      - NODE_OPTIONS=--max-old-space-size=${METAMCP_HEAP_MB:-640}
+      - POSTGRES_HOST=metamcp-db
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=metamcp
+      - POSTGRES_PASSWORD=${SERVICE_PASSWORD_METAMCPDB}
+      - POSTGRES_DB=${POSTGRESQL_DATABASE:-metamcp_db}
+      - DATABASE_URL=postgresql://metamcp:${SERVICE_PASSWORD_METAMCPDB}@metamcp-db:5432/${POSTGRESQL_DATABASE:-metamcp_db}
+      - APP_URL=${SERVICE_URL_METAMCP}
+      - NEXT_PUBLIC_APP_URL=${SERVICE_URL_METAMCP}
+      - BETTER_AUTH_SECRET=${SERVICE_PASSWORD_BETTERAUTH}
+      # Sub-MCPs, die per stdio "localhost" ansprechen, landen sonst im
+      # eigenen Container statt beim Zielprozess.
+      - TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      metamcp-db:
+        condition: service_healthy
+    # Bewusst nicht "no": ein OOM-Kill soll den Container automatisch wieder
+    # hochbringen (siehe FIX), nicht als Ausfall stehen bleiben.
+    restart: unless-stopped
+    # Harte Docker-Grenze zusaetzlich zum V8-Heap-Limit oben (siehe FIX).
+    # deploy.resources.limits wirkt nur unter Swarm und wuerde hier von
+    # Coolifys Compose-Modus ignoriert.
+    mem_limit: ${METAMCP_MEM_LIMIT:-896m}
+    mem_reservation: ${METAMCP_MEM_RESERVATION:-384m}
+    # Ohne Port-Label waehlt Traefik den exponierten Port des Containers.
+    expose:
+      - "12008"
+    networks:
+      - default
+      - coolify
+    # Coolifys generierte Labels registrieren den Container hier nicht
+    # zuverlaessig als Backend - deshalb Router und Zielport explizit
+    # (gleiche Lektion wie im Postiz-Stack).
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.metamcp-http.entryPoints=http
+      - traefik.http.routers.metamcp-http.rule=Host(`${METAMCP_DOMAIN}`)
+      - traefik.http.routers.metamcp-http.middlewares=metamcp-to-https
+      - traefik.http.routers.metamcp-https.entryPoints=https
+      - traefik.http.routers.metamcp-https.rule=Host(`${METAMCP_DOMAIN}`)
+      - traefik.http.routers.metamcp-https.tls=true
+      - traefik.http.routers.metamcp-https.tls.certresolver=letsencrypt
+      - traefik.http.routers.metamcp-https.service=metamcp-app
+      - traefik.http.services.metamcp-app.loadbalancer.server.port=12008
+      - traefik.http.middlewares.metamcp-to-https.redirectscheme.scheme=https
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1:12008/ || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  metamcp-db:
+    # Dienste eindeutig benennen (metamcp-db statt postgres): im gemeinsamen
+    # Docker-Netz, das Traefik zum Routen braucht, kollidieren generische
+    # Namen sonst mit gleichnamigen Containern anderer Stacks.
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=metamcp
+      - POSTGRES_PASSWORD=${SERVICE_PASSWORD_METAMCPDB}
+      - POSTGRES_DB=${POSTGRESQL_DATABASE:-metamcp_db}
+    volumes:
+      - metamcp-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    # Die Postgres-Instanz einer MCP-Aggregator-App braucht kein eigenes
+    # grosses Limit, aber ein Deckel verhindert, dass ein zweiter Prozess auf
+    # demselben Host unbeobachtet mitwaechst.
+    mem_limit: ${METAMCP_DB_MEM_LIMIT:-256m}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metamcp -d ${POSTGRESQL_DATABASE:-metamcp_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - default
+
+volumes:
+  metamcp-db-data:
+
+networks:
+  coolify:
+    external: true
