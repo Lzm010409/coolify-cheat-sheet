@@ -180,7 +180,10 @@ services:
       # auto-setup nutzt TEMPORAL_ADDRESS selbst, um den Server fuer die
       # Namespace-Registrierung zu erreichen. Ohne diese Zeile greift die
       # service-weite Coolify-Variable und zeigt auf den falschen Host.
-      - TEMPORAL_ADDRESS=127.0.0.1:7233
+      # Loopback funktioniert nicht: der Listener bindet per Default auf die
+      # Container-IP, deshalb der eigene Servicename.
+      - TEMPORAL_ADDRESS=temporal:7233
+      - BIND_ON_IP=0.0.0.0
       - DB=postgres12
       - DB_PORT=5432
       - POSTGRES_SEEDS=postgres
@@ -191,7 +194,7 @@ services:
       - DEFAULT_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
       - DEFAULT_NAMESPACE_RETENTION=72h
     healthcheck:
-      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/7233' || exit 1"]
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/temporal/7233' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
