@@ -111,17 +111,25 @@ services:
       temporal:
         condition: service_started
     healthcheck:
-      # Bewusst /auth statt /: die Wurzel antwortet mit 307 auf MAIN_URL.
-      # wget folgt dem Redirect, landet auf der oeffentlichen Domain und
-      # schlaegt fehl, solange Traefik den Host noch nicht kennt - der
-      # Container waere dann "unhealthy", obwohl die App laeuft.
+      # NICHT auf wget umstellen: das Image von v2.23 bringt keines mehr mit
+      # (das Coolify-Template nutzt noch eines, was unter v2.11 auch ging).
+      # Der Check lief sonst dauerhaft auf "exit=127 wget: not found", Docker
+      # markierte den Container als unhealthy - und Traefik nimmt ungesunde
+      # Container gar nicht erst in den Load Balancer auf. Ergebnis war kein
+      # Router fuer die Domain, also 404 auf http und der Catchall-503 auf
+      # https, obwohl die Anwendung einwandfrei lief.
+      # Node ist im Image immer vorhanden und hat seit v18 globales fetch.
+      #
+      # Geprueft wird /auth, nicht /: die Wurzel antwortet mit 307 auf
+      # MAIN_URL, der Check liefe damit nach draussen auf die oeffentliche
+      # Domain statt gegen den Container.
       test:
         - CMD-SHELL
-        - 'wget -qO- http://127.0.0.1:5000/auth'
-      interval: 10s
-      timeout: 20s
-      retries: 30
-      start_period: 120s
+        - "node -e \"fetch('http://127.0.0.1:5000/auth').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
   postgres:
     image: 'postgres:14.5'
     volumes:
