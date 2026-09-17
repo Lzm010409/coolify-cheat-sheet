@@ -182,14 +182,16 @@ services:
           psql -U postgres -c "ALTER USER postgres PASSWORD '$$POSTIZ_DB_PASSWORD';" \
             && echo "postgres password synced"
           # Rueckbau auf eine Temporal-freie Postiz-Version: deren Migration
-          # verweigert den Start, solange diese vier Spalten aus neueren
-          # Versionen noch Daten enthalten. Posts und Accounts bleiben.
-          psql -U postgres -d "$${POSTGRES_DB:-postiz-db}" -v ON_ERROR_STOP=0 \
+          # verweigert den Start, solange diese Spalten aus neueren Versionen
+          # noch Daten enthalten. Posts und Accounts bleiben.
+          psql -U postgres -d postiz-db -v ON_ERROR_STOP=0 \
             -c 'ALTER TABLE "Organization" DROP COLUMN IF EXISTS "shortlink";' \
             -c 'ALTER TABLE "Post" DROP COLUMN IF EXISTS "creationMethod";' \
             -c 'ALTER TABLE "Post" DROP COLUMN IF EXISTS "delay";' \
-            -c 'ALTER TABLE "User" DROP COLUMN IF EXISTS "sendStreakEmails";' \
-            && echo "legacy columns dropped"
+            -c 'ALTER TABLE "User" DROP COLUMN IF EXISTS "sendStreakEmails";'
+          echo "--- verbliebene Alt-Spalten ---"
+          psql -U postgres -d postiz-db -At -c "SELECT table_name||'.'||column_name FROM information_schema.columns WHERE column_name IN ('shortlink','creationMethod','delay','sendStreakEmails');"
+          echo "--- Ende Kontrolle ---"
         ) &
         exec docker-entrypoint.sh postgres
     healthcheck:
