@@ -1,0 +1,48 @@
+# Hermes Agent hinter Cloudflare Tunnel (von deploy.sh --mode cloudflare gerendert)
+#
+# Weg: Cloudflare -> Tunnel -> cloudflared (Host-Netz) -> localhost:80 (Traefik)
+#      -> dieser Container. Deshalb nur entryPoint "http", kein Redirect auf
+#      https und kein certresolver - TLS terminiert bei Cloudflare, ein
+#      Redirect wuerde eine Schleife erzeugen.
+# Gateway und Dashboard laufen im selben Container (HERMES_DASHBOARD=1).
+
+services:
+  hermes:
+    image: hermes-agent:latest
+    # Image wird von deploy.sh lokal gebaut bzw. getaggt - nicht ziehen.
+    pull_policy: never
+    container_name: __INSTANCE__-hermes
+    command: gateway run
+    restart: unless-stopped
+    environment:
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_HOST=0.0.0.0
+      - HERMES_DASHBOARD_PORT=9119
+      # Ohne Auth startet das Dashboard auf 0.0.0.0 nicht. Env hat Vorrang
+      # vor config.yaml.
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=__DASH_USER__
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=__DASH_PASS__
+      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=__DASH_SECRET__
+    volumes:
+      - __DATA_DIR__:/opt/data
+    # Bewusst kein "ports:" - erreichbar nur ueber Traefik bzw. den Tunnel.
+    expose:
+      - "8642"
+      - "9119"
+    networks:
+      - coolify
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.__INSTANCE__-gw.entryPoints=http
+      - traefik.http.routers.__INSTANCE__-gw.rule=Host(`__GATEWAY_DOMAIN__`)
+      - traefik.http.routers.__INSTANCE__-gw.service=__INSTANCE__-gw
+      - traefik.http.services.__INSTANCE__-gw.loadbalancer.server.port=8642
+      - traefik.http.routers.__INSTANCE__-dash.entryPoints=http
+      - traefik.http.routers.__INSTANCE__-dash.rule=Host(`__DASHBOARD_DOMAIN__`)
+      - traefik.http.routers.__INSTANCE__-dash.service=__INSTANCE__-dash
+      - traefik.http.services.__INSTANCE__-dash.loadbalancer.server.port=9119
+
+networks:
+  coolify:
+    external: true
