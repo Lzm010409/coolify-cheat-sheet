@@ -1,0 +1,161 @@
+# Hermes Agent (Nous Research) auf Coolify, veroeffentlicht per Cloudflare Tunnel
+#
+# ZIEL: Hermes laeuft auf der Coolify-Instanz und ist ueber
+# https://hermes.<domain> (Dashboard) und https://hermes-api.<domain>
+# (OpenAI-kompatible API) aus dem Internet erreichbar - ohne offenen Port am
+# Server, ohne Portfreigabe im Router und ohne Let's-Encrypt-Zertifikat auf dem
+# Server. Das TLS-Zertifikat liefert Cloudflare.
+#
+# DATENWEG:
+#   Browser --HTTPS--> Cloudflare-Edge --Tunnel--> cloudflared (Host-Netz)
+#     --HTTP--> localhost:80 = Coolify-Proxy (Traefik) --HTTP--> hermes:9119/8642
+#
+# Der Tunnel zeigt also NICHT direkt auf Hermes, sondern auf den Coolify-Proxy.
+# Traefik verteilt anhand des Hostnamens weiter. Vorteil: ein einziger Tunnel
+# fuer alle Dienste der Instanz, neue Dienste brauchen keine neue Tunnel-Route.
+#
+# ---------------------------------------------------------------------------
+# SCHRITT 1 - Tunnel in Cloudflare anlegen (einmalig pro Server)
+#   Zero Trust -> Networks -> Tunnels -> "Create a tunnel" -> Cloudflared
+#   -> Umgebung "Docker" waehlen. Aus dem angezeigten Befehl nur den Token
+#   kopieren (beginnt mit "eyJ...").
+#   Unter "Public Hostnames" / "Published application routes" eine Route:
+#     Subdomain: *            Domain: <deine-domain.de>      Path: leer
+#     Service:   HTTP         URL:    localhost:80
+#   Fuer eine Wildcard-Route legt Cloudflare den DNS-Eintrag nicht immer selbst
+#   an. Dann manuell unter DNS: CNAME  *  ->  <TUNNEL-ID>.cfargotunnel.com,
+#   Proxy-Status "Proxied" (orange Wolke). Existiert schon ein A-Record fuer
+#   hermes/hermes-api (z. B. auf die Server-IP), diesen loeschen - sonst
+#   gewinnt der spezifische Record gegen die Wildcard und der Tunnel wird
+#   umgangen.
+#   Achtung: Das kostenlose Universal-SSL deckt nur EINE Ebene ab
+#   (*.domain.de). "hermes.intern.domain.de" bekaeme kein Zertifikat.
+#
+# SCHRITT 2 - cloudflared in Coolify starten (einmalig pro Server)
+#   Coolify -> Projekt -> + New -> Service -> "Cloudflared" suchen.
+#   Variable CLOUDFLARE_TUNNEL_TOKEN = Token aus Schritt 1 -> Deploy.
+#   Die Vorlage laeuft mit network_mode: host - deshalb ist "localhost:80"
+#   in der Tunnel-Route tatsaechlich der Coolify-Proxy. In Cloudflare muss
+#   der Tunnel danach "HEALTHY" zeigen. Pruefen unter Servers -> Proxy, dass
+#   der Proxy (Traefik) laeuft.
+#
+# SCHRITT 3 - Hermes einmalig einrichten (Provider, Modell, SOUL.md)
+#   Nach dem ersten Deploy in Coolify beim Container "hermes" den Tab
+#   "Terminal" oeffnen und den Setup-Assistenten ausfuehren (entspricht
+#   `docker run -it ... nousresearch/hermes-agent setup` aus der Upstream-
+#   Doku). Alles landet im Volume /opt/data (config.yaml, .env, Sessions,
+#   Memories, Skills) und ueberlebt Redeploys.
+#
+# SCHRITT 4 - Diese Compose-Datei in Coolify deployen
+#   + New -> Docker Compose (Empty) -> Inhalt einfuegen. Variablen setzen:
+#     HERMES_DOMAIN       z. B. hermes.deine-domain.de
+#     HERMES_API_DOMAIN   z. B. hermes-api.deine-domain.de
+#   SERVICE_USER_/SERVICE_PASSWORD_-Variablen erzeugt Coolify automatisch;
+#   die Zugangsdaten stehen danach im Tab "Environment Variables".
+#   Das Domain-Feld von Coolify fuer den Service LEER lassen - das Routing
+#   kommt aus den Labels unten (gleiche Lektion wie bei Postiz/MetaMCP:
+#   Coolifys generierte Labels registrieren das Backend nicht zuverlaessig).
+#
+# SCHRITT 5 - trusted_proxies in Hermes setzen
+#   Hermes sieht als Absender nicht Cloudflare, sondern Traefik. Damit Login,
+#   Redirects und Client-IP hinter dem Proxy korrekt funktionieren, in
+#   /opt/data/config.yaml (per Coolify-Terminal editieren):
+#       dashboard:
+#         public_url: "https://hermes.deine-domain.de"
+#         trusted_proxies:
+#           - "<Subnetz des coolify-Netzes>"
+#   Das Subnetz auf dem Server ermitteln mit
+#       docker network inspect coolify -f '{{(index .IPAM.Config 0).Subnet}}'
+#   Hermes lehnt "*", "0.0.0.0/0" und "::/0" bewusst ab - nur das konkrete
+#   Subnetz bzw. die IP von coolify-proxy eintragen. Danach Hermes neu starten.
+#
+# SCHRITT 6 - Cloudflare Access vor das Dashboard (dringend empfohlen)
+#   Hermes ist ein Agent mit Shell-, Datei- und Tool-Zugriff. Ein offenes
+#   Dashboard im Internet ist damit faktisch ein Fernzugang zum Container.
+#   Basic-Auth unten ist Pflicht (Hermes startet ohne Auth auf 0.0.0.0 gar
+#   nicht), reicht allein aber nicht. Zusaetzlich:
+#     Zero Trust -> Access -> Applications -> Self-hosted
+#     Domain: hermes.deine-domain.de, Policy: Allow, Emails = eigene Adresse(n)
+#   Dann kommt vor Hermes' eigenem Login noch ein Cloudflare-Login (Einmal-
+#   code per Mail). Die API-Domain NICHT hinter Access haengen - API-Clients
+#   (Open WebUI, n8n, Skripte) koennen den Browser-Login nicht; die API ist
+#   ueber API_SERVER_KEY (Bearer-Token) geschuetzt. Wer die API nur intern
+#   braucht, laesst HERMES_API_DOMAIN einfach weg und spricht Hermes aus
+#   anderen Coolify-Stacks ueber http://hermes:8642 im coolify-Netz an.
+#
+# WICHTIGE STOLPERFALLEN
+#   - Kein HTTP->HTTPS-Redirect in Traefik! Der Tunnel liefert HTTP an Port 80;
+#     ein Redirect auf https fuehrt zur Endlosschleife (ERR_TOO_MANY_REDIRECTS).
+#     Deshalb unten nur Router auf entryPoint "http", ohne certresolver.
+#     Wird Hermes stattdessen ueber Coolifys Domain-Feld veroeffentlicht:
+#     Domain mit https:// eintragen, aber auf der Domains-Seite "Force HTTPS"
+#     / Redirect deaktivieren.
+#   - HTTPS erzwingt Cloudflare selbst: SSL/TLS -> Edge Certificates ->
+#     "Always Use HTTPS" an. Der SSL-Modus (Flexible/Full) spielt fuer Tunnel-
+#     Routen keine Rolle.
+#   - Keine Ports (ports:) veroeffentlichen. Mit Tunnel muss am Server und in
+#     der Firewall nichts ausser SSH offen sein - 80/443 koennen zu bleiben.
+#   - Dashboard/Chat nutzen Streaming (SSE/WebSocket). Das geht durch den
+#     Tunnel, aber keine Cache-Regeln und kein "Rocket Loader" auf die
+#     Hermes-Hostnamen legen.
+#
+# TEST
+#   curl -I https://hermes.deine-domain.de      -> 302 zu Cloudflare Access
+#                                                  (bzw. 401 ohne Access)
+#   curl https://hermes-api.deine-domain.de/health
+#   curl -H "Authorization: Bearer <API_SERVER_KEY>" \
+#        https://hermes-api.deine-domain.de/v1/models
+#
+# Quellen: coolify.io/docs/knowledge-base/cloudflare/tunnels/all-resource,
+# hermes-agent.nousresearch.com/docs/user-guide/docker,
+# github.com/coollabsio/coolify templates/compose/cloudflared.yaml.
+
+services:
+  hermes:
+    container_name: hermes
+    image: nousresearch/hermes-agent:${HERMES_TAG:-stable}
+    command: gateway run
+    environment:
+      # Dashboard (Port 9119) als supervised Dienst im selben Container.
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_HOST=0.0.0.0
+      - HERMES_DASHBOARD_PORT=9119
+      # Ohne Auth verweigert Hermes den Start auf 0.0.0.0 ("fails closed").
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${SERVICE_USER_HERMES}
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${SERVICE_PASSWORD_HERMES}
+      # Sessions ueberleben Neustarts, statt bei jedem Redeploy auszuloggen.
+      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=${SERVICE_PASSWORD_64_HERMESSESSION}
+      # OpenAI-kompatible API (Port 8642), per Bearer-Token geschuetzt.
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY=${SERVICE_PASSWORD_64_HERMESAPI}
+    volumes:
+      - hermes-data:/opt/data
+    restart: unless-stopped
+    # Bewusst kein "ports:" - erreichbar nur ueber Traefik bzw. den Tunnel.
+    expose:
+      - "9119"
+      - "8642"
+    networks:
+      - coolify
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      # Nur entryPoint "http": der Tunnel spricht HTTP mit Traefik, TLS
+      # terminiert bei Cloudflare. Kein Redirect, kein certresolver (siehe
+      # STOLPERFALLEN).
+      - traefik.http.routers.hermes-dash.entryPoints=http
+      - traefik.http.routers.hermes-dash.rule=Host(`${HERMES_DOMAIN}`)
+      - traefik.http.routers.hermes-dash.service=hermes-dash
+      - traefik.http.services.hermes-dash.loadbalancer.server.port=9119
+      - traefik.http.routers.hermes-api.entryPoints=http
+      - traefik.http.routers.hermes-api.rule=Host(`${HERMES_API_DOMAIN}`)
+      - traefik.http.routers.hermes-api.service=hermes-api
+      - traefik.http.services.hermes-api.loadbalancer.server.port=8642
+
+volumes:
+  hermes-data:
+
+networks:
+  coolify:
+    external: true
