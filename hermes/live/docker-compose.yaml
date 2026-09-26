@@ -8,10 +8,20 @@
 #   https://hermes.gollenstede.app          Dashboard (Port 9119)
 #   https://hermes-gateway.gollenstede.app  OpenAI-kompatible API (Port 8642)
 #
-# Zugangsdaten erzeugt Coolify aus den SERVICE_*-Variablen; sie stehen im
-# Service unter "Environment Variables" (nicht hier, nicht im Repo):
-#   SERVICE_USER_HERMES / SERVICE_PASSWORD_HERMES  -> Dashboard-Login
-#   SERVICE_PASSWORD_64_HERMESAPI                  -> API_SERVER_KEY (Bearer)
+# Dashboard-Anmeldung AUSSCHLIESSLICH ueber Microsoft Entra ID (OIDC,
+# Tenant gollenstede-sachverstand.de). Die Passwort-Anmeldung (basic) ist
+# entfernt; ohne gueltige Entra-Werte startet das Dashboard gar nicht
+# (Hermes "fails closed"), der Gateway/API laeuft davon unabhaengig weiter.
+# Wer sich anmelden darf, regelt Entra: Enterprise-App -> "Zuweisung
+# erforderlich" = Ja und nur zugewiesene Benutzer/Gruppen. Hermes selbst
+# kennt keine Benutzer-Allowlist - jede Anmeldung, die Entra zulaesst, kommt
+# ins Dashboard.
+#
+# In Coolify unter "Environment Variables" zu setzen (nicht im Repo):
+#   ENTRA_CLIENT_ID      Anwendungs-(Client-)ID der App-Registrierung
+#   ENTRA_CLIENT_SECRET  Geheimer Clientschluessel (Wert, nicht die ID)
+# Von Coolify erzeugt:
+#   SERVICE_PASSWORD_64_HERMESAPI -> API_SERVER_KEY (Bearer fuer die API)
 #
 # Nach dem ersten Start: LLM-Provider einrichten, entweder im Dashboard oder in
 # Coolify -> Service -> Terminal (Container hermes): `hermes setup`.
@@ -42,9 +52,14 @@ services:
       - HERMES_DASHBOARD=1
       - HERMES_DASHBOARD_HOST=0.0.0.0
       - HERMES_DASHBOARD_PORT=9119
-      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${SERVICE_USER_HERMES}
-      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${SERVICE_PASSWORD_HERMES}
-      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=${SERVICE_PASSWORD_64_HERMESSESSION}
+      # Callback = <public_url>/auth/callback - so in Entra als Web-Umleitungs-URI.
+      - HERMES_DASHBOARD_PUBLIC_URL=https://hermes.gollenstede.app
+      # Single-Tenant: nur Konten aus dem eigenen Entra-Verzeichnis.
+      - HERMES_DASHBOARD_OIDC_ISSUER=https://login.microsoftonline.com/e6787785-f3b6-4f22-8189-c9160e6d46df/v2.0
+      - HERMES_DASHBOARD_OIDC_CLIENT_ID=${ENTRA_CLIENT_ID}
+      # Vertraulicher Client (Secret + PKCE); ab Hermes v2026.9.24 unterstuetzt.
+      - HERMES_DASHBOARD_OIDC_CLIENT_SECRET=${ENTRA_CLIENT_SECRET}
+      - HERMES_DASHBOARD_OIDC_SCOPES=openid profile email offline_access
       - API_SERVER_ENABLED=true
       - API_SERVER_HOST=0.0.0.0
       - API_SERVER_PORT=8642
