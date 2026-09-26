@@ -1,0 +1,92 @@
+# Hermes Agent - produktiver Stack auf Coolify
+#
+# Server:   relieved-rattlesnake-yhzkjajtvjd2jkg9avymfakp (2.28.110.134)
+# Projekt:  Hermes-Agents / production
+# Anlage:   per Coolify-API (POST /services, docker_compose_raw = diese Datei)
+#
+# Oeffentlich ueber Cloudflare (Proxy, SSL-Modus Full) -> Traefik auf dem Server:
+#   https://hermes.gollenstede.app          Dashboard (Port 9119)
+#   https://hermes-gateway.gollenstede.app  OpenAI-kompatible API (Port 8642)
+#
+# Zugangsdaten erzeugt Coolify aus den SERVICE_*-Variablen; sie stehen im
+# Service unter "Environment Variables" (nicht hier, nicht im Repo):
+#   SERVICE_USER_HERMES / SERVICE_PASSWORD_HERMES  -> Dashboard-Login
+#   SERVICE_PASSWORD_64_HERMESAPI                  -> API_SERVER_KEY (Bearer)
+#
+# Nach dem ersten Start: LLM-Provider einrichten, entweder im Dashboard oder in
+# Coolify -> Service -> Terminal (Container hermes): `hermes setup`.
+#
+# Designentscheidungen:
+#   - Offizielles Image statt lokalem Build (kein SSH-Zugang noetig).
+#   - Gateway + Dashboard in EINEM Container: das Image supervisiert beides
+#     per s6 (HERMES_DASHBOARD=1). Entrypoint nicht ueberschreiben.
+#   - Kein healthcheck: ist der Gateway ohne konfigurierten Provider noch
+#     nicht gesund, wuerde Traefik sonst auch das Dashboard aus dem Routing
+#     nehmen - genau das Dashboard, mit dem man den Provider einrichtet.
+#   - Router auf http UND https ohne Redirect: Cloudflare spricht den Origin
+#     im Modus Full je nach Besucherprotokoll an; ein Redirect kann bei
+#     spaeterem Wechsel auf Cloudflare Tunnel/Flexible zur Schleife werden.
+#     HTTPS erzwingt Cloudflare ("Always Use HTTPS").
+#   - priority=100: auf dem Server existierte vor der Anlage bereits ein
+#     Traefik-Router fuer diese Hosts ohne Backend (503 "no available
+#     server", Ueberbleibsel eines frueheren Versuchs). Die hoehere Prioritaet
+#     sorgt dafuer, dass dieser Stack gewinnt.
+#   - Benannte Volume fuer /opt/data (SQLite im WAL-Modus braucht natives FS).
+
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    command: gateway run
+    restart: unless-stopped
+    environment:
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_HOST=0.0.0.0
+      - HERMES_DASHBOARD_PORT=9119
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${SERVICE_USER_HERMES}
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${SERVICE_PASSWORD_HERMES}
+      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=${SERVICE_PASSWORD_64_HERMESSESSION}
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8642
+      - API_SERVER_KEY=${SERVICE_PASSWORD_64_HERMESAPI}
+    volumes:
+      - hermes-data:/opt/data
+    expose:
+      - "8642"
+      - "9119"
+    networks:
+      - coolify
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      # Dashboard
+      - traefik.http.routers.hermes-dash-http.entryPoints=http
+      - traefik.http.routers.hermes-dash-http.rule=Host(`hermes.gollenstede.app`)
+      - traefik.http.routers.hermes-dash-http.priority=100
+      - traefik.http.routers.hermes-dash-http.service=hermes-dash
+      - traefik.http.routers.hermes-dash-https.entryPoints=https
+      - traefik.http.routers.hermes-dash-https.rule=Host(`hermes.gollenstede.app`)
+      - traefik.http.routers.hermes-dash-https.priority=100
+      - traefik.http.routers.hermes-dash-https.tls=true
+      - traefik.http.routers.hermes-dash-https.tls.certresolver=letsencrypt
+      - traefik.http.routers.hermes-dash-https.service=hermes-dash
+      - traefik.http.services.hermes-dash.loadbalancer.server.port=9119
+      # Gateway-API
+      - traefik.http.routers.hermes-gw-http.entryPoints=http
+      - traefik.http.routers.hermes-gw-http.rule=Host(`hermes-gateway.gollenstede.app`)
+      - traefik.http.routers.hermes-gw-http.priority=100
+      - traefik.http.routers.hermes-gw-http.service=hermes-gw
+      - traefik.http.routers.hermes-gw-https.entryPoints=https
+      - traefik.http.routers.hermes-gw-https.rule=Host(`hermes-gateway.gollenstede.app`)
+      - traefik.http.routers.hermes-gw-https.priority=100
+      - traefik.http.routers.hermes-gw-https.tls=true
+      - traefik.http.routers.hermes-gw-https.tls.certresolver=letsencrypt
+      - traefik.http.routers.hermes-gw-https.service=hermes-gw
+      - traefik.http.services.hermes-gw.loadbalancer.server.port=8642
+
+volumes:
+  hermes-data:
+
+networks:
+  coolify:
+    external: true
